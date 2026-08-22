@@ -1,0 +1,369 @@
+name: Build CHIZI sing-box ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "CHIZI branch / tag / commit"
+        required: true
+        default: "testing-ebpf-cilium"
+        type: string
+
+      force_rebuild:
+        description: "Rebuild even if this SHA already has a release"
+        required: false
+        default: false
+        type: boolean
+
+  schedule:
+    # 每 4 小时检查一次 CHIZI
+    - cron: "17 */4 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chizi-sing-box-build
+  cancel-in-progress: true
+
+env:
+  SOURCE_REPO: CHIZI-0618/sing-box
+  SOURCE_BRANCH: testing-ebpf-cilium
+
+  BUILD_TAGS: >-
+    with_ebpf,with_quic,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve source ref
+        id: source_ref
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            REF="${{ inputs.source_ref }}"
+          else
+            REF="${SOURCE_BRANCH}"
+          fi
+
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "Source ref: ${REF}"
+
+      - name: Checkout CHIZI sing-box
+        uses: actions/checkout@v4
+        with:
+          repository: CHIZI-0618/sing-box
+          ref: ${{ steps.source_ref.outputs.ref }}
+          path: source
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Read source metadata
+        id: meta
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=8 HEAD)"
+          COMMIT_DATE="$(git show -s --format=%cI HEAD)"
+          COMMIT_SUBJECT="$(git show -s --format=%s HEAD)"
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "commit_date=${COMMIT_DATE}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "commit_subject<<EOF"
+            echo "${COMMIT_SUBJECT}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "========================================"
+          echo "Repository : ${SOURCE_REPO}"
+          echo "Ref        : ${{ steps.source_ref.outputs.ref }}"
+          echo "SHA        : ${SHA}"
+          echo "Date       : ${COMMIT_DATE}"
+          echo "Commit     : ${COMMIT_SUBJECT}"
+          echo "========================================"
+
+      - name: Check whether already built
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="chizi-ebpf-${{ steps.meta.outputs.short_sha }}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            EXISTS=true
+          else
+            EXISTS=false
+          fi
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] &&
+             [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
+            EXISTS=false
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "exists=${EXISTS}" >> "$GITHUB_OUTPUT"
+
+          echo "Release tag : ${TAG}"
+          echo "Already built: ${EXISTS}"
+
+      - name: Stop if source SHA already built
+        if: steps.existing.outputs.exists == 'true'
+        shell: bash
+        run: |
+          echo "CHIZI SHA ${{ steps.meta.outputs.sha }} has already been built."
+          echo "Nothing to do."
+
+      - name: Setup Go
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: true
+          cache-dependency-path: source/go.sum
+
+      - name: Show Go environment
+        if: steps.existing.outputs.exists != 'true'
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          go version
+          go env GOOS GOARCH GOHOSTOS GOHOSTARCH
+
+      - name: Determine sing-box base version
+        if: steps.existing.outputs.exists != 'true'
+        id: version
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_VERSION="$(
+            CGO_ENABLED=0 go run ./cmd/internal/read_tag \
+              | tail -n 1 \
+              | tr -d '\r\n'
+          )"
+
+          if [[ -z "${BASE_VERSION}" || "${BASE_VERSION}" == "unknown" ]]; then
+            echo "ERROR: unable to determine sing-box base version"
+            exit 1
+          fi
+
+          VERSION="${BASE_VERSION}-chizi.${{ steps.meta.outputs.short_sha }}"
+
+          echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          echo "Base version : ${BASE_VERSION}"
+          echo "Build version: ${VERSION}"
+
+      - name: Verify checked-in eBPF objects
+        if: steps.existing.outputs.exists != 'true'
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking generated eBPF objects..."
+
+          test -f common/ebpf/internal/bpfgen/cgroup_bpfel.o
+          test -f common/ebpf/internal/bpfgen/shared_network_bpfel.o
+          test -f common/ebpf/internal/bpfgen/splice_bpfel.o
+          test -f common/ebpf/internal/bpfgen/manifest.txt
+
+          ls -lh \
+            common/ebpf/internal/bpfgen/cgroup_bpfel.o \
+            common/ebpf/internal/bpfgen/shared_network_bpfel.o \
+            common/ebpf/internal/bpfgen/splice_bpfel.o
+
+      - name: Run focused eBPF tests
+        if: steps.existing.outputs.exists != 'true'
+        working-directory: source
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+
+          go test \
+            -count=1 \
+            -tags "with_ebpf" \
+            ./common/ebpf \
+            ./protocol/ebpf \
+            ./include \
+            ./option
+
+      - name: Build Linux ARM64
+        if: steps.existing.outputs.exists != 'true'
+        working-directory: source
+        shell: bash
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          VERSION="${{ steps.version.outputs.version }}"
+          SHARED_LDFLAGS="$(tr -d '\n' < release/LDFLAGS)"
+
+          echo "========================================"
+          echo "Target : linux/arm64"
+          echo "CGO    : ${CGO_ENABLED}"
+          echo "Tags   : ${BUILD_TAGS}"
+          echo "Version: ${VERSION}"
+          echo "========================================"
+
+          go build \
+            -trimpath \
+            -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${SHARED_LDFLAGS} -s -w -buildid=" \
+            -o dist/sing-box-linux-arm64 \
+            ./cmd/sing-box
+
+      - name: Validate ARM64 binary
+        if: steps.existing.outputs.exists != 'true'
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="dist/sing-box-linux-arm64"
+
+          test -s "${BIN}"
+
+          echo "========================================"
+          file "${BIN}"
+          echo "========================================"
+          ls -lh "${BIN}"
+          echo "========================================"
+          sha256sum "${BIN}"
+          echo "========================================"
+
+          FILE_INFO="$(file "${BIN}")"
+
+          if ! grep -qi "ARM aarch64\|ARM64" <<< "${FILE_INFO}"; then
+            echo "ERROR: output is not ARM64"
+            exit 1
+          fi
+
+          if grep -qi "dynamically linked" <<< "${FILE_INFO}"; then
+            echo "ERROR: binary is dynamically linked"
+            exit 1
+          fi
+
+      - name: Build native AMD64 probe
+        if: steps.existing.outputs.exists != 'true'
+        working-directory: source
+        shell: bash
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.version.outputs.version }}"
+          SHARED_LDFLAGS="$(tr -d '\n' < release/LDFLAGS)"
+
+          go build \
+            -trimpath \
+            -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${SHARED_LDFLAGS} -s -w -buildid=" \
+            -o /tmp/sing-box-linux-amd64 \
+            ./cmd/sing-box
+
+          echo "========================================"
+          /tmp/sing-box-linux-amd64 version
+          echo "========================================"
+
+      - name: Create checksum and metadata
+        if: steps.existing.outputs.exists != 'true'
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd dist
+
+          sha256sum sing-box-linux-arm64 > sing-box-linux-arm64.sha256
+
+          cat > build-info.txt <<EOF
+          Repository: CHIZI-0618/sing-box
+          Ref: ${{ steps.source_ref.outputs.ref }}
+          Commit: ${{ steps.meta.outputs.sha }}
+          Commit date: ${{ steps.meta.outputs.commit_date }}
+          Commit subject: ${{ steps.meta.outputs.commit_subject }}
+          Base version: ${{ steps.version.outputs.base }}
+          Build version: ${{ steps.version.outputs.version }}
+          Target: linux/arm64
+          CGO_ENABLED: 0
+          Build tags: ${BUILD_TAGS}
+          EOF
+
+          cat build-info.txt
+
+      - name: Upload workflow artifact
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-chizi-${{ steps.meta.outputs.short_sha }}
+          path: |
+            source/dist/sing-box-linux-arm64
+            source/dist/sing-box-linux-arm64.sha256
+            source/dist/build-info.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.existing.outputs.tag }}"
+          VERSION="${{ steps.version.outputs.version }}"
+
+          cat > /tmp/release-notes.md <<EOF
+          ## CHIZI sing-box ARM64
+
+          - Version: \`${VERSION}\`
+          - Upstream: \`CHIZI-0618/sing-box\`
+          - Branch/ref: \`${{ steps.source_ref.outputs.ref }}\`
+          - Commit: \`${{ steps.meta.outputs.sha }}\`
+          - Commit date: \`${{ steps.meta.outputs.commit_date }}\`
+          - Commit: ${{ steps.meta.outputs.commit_subject }}
+          - Target: \`linux/arm64\`
+          - CGO: \`disabled\`
+          - Build tags: \`${BUILD_TAGS}\`
+
+          Source is pinned to the exact CHIZI commit above.
+          EOF
+
+          gh release create "${TAG}" \
+            --target "${GITHUB_SHA}" \
+            --title "${VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            source/dist/sing-box-linux-arm64 \
+            source/dist/sing-box-linux-arm64.sha256 \
+            source/dist/build-info.txt
