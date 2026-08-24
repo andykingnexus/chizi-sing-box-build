@@ -38,6 +38,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ============================================================
+      # 1. 确定需要构建的 CHIZI ref
+      # ============================================================
       - name: Resolve source ref
         id: source_ref
         shell: bash
@@ -51,8 +54,18 @@ jobs:
           fi
 
           echo "ref=${REF}" >> "$GITHUB_OUTPUT"
-          echo "Source ref: ${REF}"
 
+          echo "========================================"
+          echo "Source repo: ${SOURCE_REPO}"
+          echo "Source ref : ${REF}"
+          echo "========================================"
+
+      # ============================================================
+      # 2. Checkout CHIZI
+      #
+      # 必须完整获取 Git history + tags。
+      # sing-box 的版本基于 Git tag，因此不能使用浅克隆。
+      # ============================================================
       - name: Checkout CHIZI sing-box
         uses: actions/checkout@v4
         with:
@@ -62,6 +75,9 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # ============================================================
+      # 3. 读取 CHIZI 源码信息
+      # ============================================================
       - name: Read source metadata
         id: meta
         working-directory: source
@@ -88,10 +104,20 @@ jobs:
           echo "Repository : ${SOURCE_REPO}"
           echo "Ref        : ${{ steps.source_ref.outputs.ref }}"
           echo "SHA        : ${SHA}"
+          echo "Short SHA  : ${SHORT_SHA}"
           echo "Date       : ${COMMIT_DATE}"
           echo "Commit     : ${COMMIT_SUBJECT}"
           echo "========================================"
 
+      # ============================================================
+      # 4. 检查这个 CHIZI commit 是否已经构建
+      #
+      # 一个 CHIZI SHA 对应一个 Release：
+      #
+      #   chizi-ebpf-e9dbd756
+      #
+      # 定时任务不会反复构建同一源码。
+      # ============================================================
       - name: Check whether already built
         id: existing
         env:
@@ -117,16 +143,28 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "exists=${EXISTS}" >> "$GITHUB_OUTPUT"
 
-          echo "Release tag : ${TAG}"
+          echo "========================================"
+          echo "Release tag  : ${TAG}"
           echo "Already built: ${EXISTS}"
+          echo "========================================"
 
       - name: Stop if source SHA already built
         if: steps.existing.outputs.exists == 'true'
         shell: bash
         run: |
-          echo "CHIZI SHA ${{ steps.meta.outputs.sha }} has already been built."
+          echo "========================================"
+          echo "CHIZI SHA already built:"
+          echo "${{ steps.meta.outputs.sha }}"
+          echo
+          echo "Release:"
+          echo "${{ steps.existing.outputs.tag }}"
+          echo
           echo "Nothing to do."
+          echo "========================================"
 
+      # ============================================================
+      # 5. Go
+      # ============================================================
       - name: Setup Go
         if: steps.existing.outputs.exists != 'true'
         uses: actions/setup-go@v5
@@ -142,9 +180,26 @@ jobs:
         run: |
           set -euo pipefail
 
+          echo "========================================"
           go version
-          go env GOOS GOARCH GOHOSTOS GOHOSTARCH
+          echo
+          go env GOOS GOARCH GOHOSTOS GOHOSTARCH CGO_ENABLED
+          echo "========================================"
 
+      # ============================================================
+      # 6. 生成版本号
+      #
+      # 不再执行 cmd/internal/read_tag。
+      #
+      # 原因：
+      # read_tag 在 HEAD 不等于 tag 时，本身就会追加 commit SHA，
+      # 再追加 -chizi.<SHA> 会造成 SHA 重复。
+      #
+      # 最终格式：
+      #
+      #   1.14.0-rc.1-chizi.e9dbd756
+      #
+      # ============================================================
       - name: Determine sing-box base version
         if: steps.existing.outputs.exists != 'true'
         id: version
@@ -153,25 +208,59 @@ jobs:
         run: |
           set -euo pipefail
 
-          BASE_VERSION="$(
-            CGO_ENABLED=0 go run ./cmd/internal/read_tag \
-              | tail -n 1 \
-              | tr -d '\r\n'
+          echo "========================================"
+          echo "Git repository information"
+          echo "========================================"
+
+          echo "Shallow repository:"
+          git rev-parse --is-shallow-repository
+
+          echo
+          echo "HEAD:"
+          git rev-parse HEAD
+
+          echo
+          echo "Nearest sing-box version tag:"
+
+          BASE_TAG="$(
+            git describe \
+              --tags \
+              --match 'v[0-9]*' \
+              --abbrev=0 \
+              HEAD
           )"
 
-          if [[ -z "${BASE_VERSION}" || "${BASE_VERSION}" == "unknown" ]]; then
-            echo "ERROR: unable to determine sing-box base version"
+          echo "${BASE_TAG}"
+
+          BASE_VERSION="${BASE_TAG#v}"
+
+          if [[ -z "${BASE_VERSION}" || "${BASE_VERSION}" == "${BASE_TAG}" ]]; then
+            echo "ERROR: unable to determine valid sing-box base version"
+            echo "BASE_TAG=${BASE_TAG}"
             exit 1
           fi
 
-          VERSION="${BASE_VERSION}-chizi.${{ steps.meta.outputs.short_sha }}"
+          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
+          VERSION="${BASE_VERSION}-chizi.${SHORT_SHA}"
 
+          echo "base_tag=${BASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "base=${BASE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+          echo
+          echo "========================================"
+          echo "Base tag     : ${BASE_TAG}"
           echo "Base version : ${BASE_VERSION}"
+          echo "Source SHA   : ${SHORT_SHA}"
           echo "Build version: ${VERSION}"
+          echo "========================================"
 
+      # ============================================================
+      # 7. 验证 CHIZI 已提交的 eBPF object
+      #
+      # 当前 CHIZI eBPF 使用 checked-in generated objects。
+      # 构建 ARM64 sing-box 时直接嵌入这些 object。
+      # ============================================================
       - name: Verify checked-in eBPF objects
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -186,11 +275,19 @@ jobs:
           test -f common/ebpf/internal/bpfgen/splice_bpfel.o
           test -f common/ebpf/internal/bpfgen/manifest.txt
 
+          echo
           ls -lh \
             common/ebpf/internal/bpfgen/cgroup_bpfel.o \
             common/ebpf/internal/bpfgen/shared_network_bpfel.o \
             common/ebpf/internal/bpfgen/splice_bpfel.o
 
+          echo
+          echo "Manifest:"
+          cat common/ebpf/internal/bpfgen/manifest.txt
+
+      # ============================================================
+      # 8. CHIZI eBPF 相关 Go tests
+      # ============================================================
       - name: Run focused eBPF tests
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -208,6 +305,12 @@ jobs:
             ./include \
             ./option
 
+      # ============================================================
+      # 9. 编译 Linux ARM64
+      #
+      # 不在 x86 GitHub runner 上执行 ARM64 binary，
+      # 避免 Exec format error。
+      # ============================================================
       - name: Build Linux ARM64
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -225,7 +328,7 @@ jobs:
           SHARED_LDFLAGS="$(tr -d '\n' < release/LDFLAGS)"
 
           echo "========================================"
-          echo "Target : linux/arm64"
+          echo "Target : ${GOOS}/${GOARCH}"
           echo "CGO    : ${CGO_ENABLED}"
           echo "Tags   : ${BUILD_TAGS}"
           echo "Version: ${VERSION}"
@@ -234,10 +337,13 @@ jobs:
           go build \
             -trimpath \
             -tags "${BUILD_TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${SHARED_LDFLAGS} -s -w -buildid=" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VERSION} ${SHARED_LDFLAGS} -s -w -buildid=" \
             -o dist/sing-box-linux-arm64 \
             ./cmd/sing-box
 
+      # ============================================================
+      # 10. 静态验证 ARM64 二进制
+      # ============================================================
       - name: Validate ARM64 binary
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -259,7 +365,7 @@ jobs:
 
           FILE_INFO="$(file "${BIN}")"
 
-          if ! grep -qi "ARM aarch64\|ARM64" <<< "${FILE_INFO}"; then
+          if ! grep -Eqi 'ARM aarch64|ARM64|aarch64' <<< "${FILE_INFO}"; then
             echo "ERROR: output is not ARM64"
             exit 1
           fi
@@ -269,6 +375,12 @@ jobs:
             exit 1
           fi
 
+      # ============================================================
+      # 11. 构建 AMD64 probe
+      #
+      # 用 native AMD64 binary 实际执行 version，
+      # 验证 Version ldflags 和 BUILD_TAGS。
+      # ============================================================
       - name: Build native AMD64 probe
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -286,7 +398,7 @@ jobs:
           go build \
             -trimpath \
             -tags "${BUILD_TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${VERSION}' ${SHARED_LDFLAGS} -s -w -buildid=" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VERSION} ${SHARED_LDFLAGS} -s -w -buildid=" \
             -o /tmp/sing-box-linux-amd64 \
             ./cmd/sing-box
 
@@ -294,6 +406,24 @@ jobs:
           /tmp/sing-box-linux-amd64 version
           echo "========================================"
 
+          VERSION_OUTPUT="$(
+            /tmp/sing-box-linux-amd64 version 2>&1
+          )"
+
+          if ! grep -Fq "${VERSION}" <<< "${VERSION_OUTPUT}"; then
+            echo "ERROR: embedded version does not match expected version"
+            echo "Expected: ${VERSION}"
+            exit 1
+          fi
+
+          if ! grep -Fq "with_ebpf" <<< "${VERSION_OUTPUT}"; then
+            echo "ERROR: with_ebpf build tag is missing"
+            exit 1
+          fi
+
+      # ============================================================
+      # 12. checksum + metadata
+      # ============================================================
       - name: Create checksum and metadata
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -306,11 +436,12 @@ jobs:
           sha256sum sing-box-linux-arm64 > sing-box-linux-arm64.sha256
 
           cat > build-info.txt <<EOF
-          Repository: CHIZI-0618/sing-box
+          Repository: ${SOURCE_REPO}
           Ref: ${{ steps.source_ref.outputs.ref }}
           Commit: ${{ steps.meta.outputs.sha }}
           Commit date: ${{ steps.meta.outputs.commit_date }}
           Commit subject: ${{ steps.meta.outputs.commit_subject }}
+          Base tag: ${{ steps.version.outputs.base_tag }}
           Base version: ${{ steps.version.outputs.base }}
           Build version: ${{ steps.version.outputs.version }}
           Target: linux/arm64
@@ -318,8 +449,15 @@ jobs:
           Build tags: ${BUILD_TAGS}
           EOF
 
+          echo "========================================"
           cat build-info.txt
+          echo "========================================"
 
+          cat sing-box-linux-arm64.sha256
+
+      # ============================================================
+      # 13. Workflow artifact
+      # ============================================================
       - name: Upload workflow artifact
         if: steps.existing.outputs.exists != 'true'
         uses: actions/upload-artifact@v4
@@ -332,6 +470,9 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # ============================================================
+      # 14. GitHub Release
+      # ============================================================
       - name: Publish GitHub Release
         if: steps.existing.outputs.exists != 'true'
         env:
@@ -348,17 +489,22 @@ jobs:
           ## CHIZI sing-box ARM64
 
           - Version: \`${VERSION}\`
-          - Upstream: \`CHIZI-0618/sing-box\`
+          - Base version: \`${{ steps.version.outputs.base }}\`
+          - Upstream: \`${SOURCE_REPO}\`
           - Branch/ref: \`${{ steps.source_ref.outputs.ref }}\`
           - Commit: \`${{ steps.meta.outputs.sha }}\`
           - Commit date: \`${{ steps.meta.outputs.commit_date }}\`
-          - Commit: ${{ steps.meta.outputs.commit_subject }}
+          - Commit subject: ${{ steps.meta.outputs.commit_subject }}
           - Target: \`linux/arm64\`
           - CGO: \`disabled\`
           - Build tags: \`${BUILD_TAGS}\`
 
           Source is pinned to the exact CHIZI commit above.
           EOF
+
+          echo "========================================"
+          cat /tmp/release-notes.md
+          echo "========================================"
 
           gh release create "${TAG}" \
             --target "${GITHUB_SHA}" \
