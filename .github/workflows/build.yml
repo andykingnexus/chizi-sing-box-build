@@ -29,6 +29,7 @@ concurrency:
 env:
   SOURCE_REPO: CHIZI-0618/sing-box
   SOURCE_BRANCH: testing-ebpf-cilium
+  UPSTREAM_REPO: https://github.com/SagerNet/sing-box.git
 
   BUILD_TAGS: >-
     with_ebpf,with_quic,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0
@@ -62,9 +63,6 @@ jobs:
 
       # ============================================================
       # 2. Checkout CHIZI
-      #
-      # 必须完整获取 Git history + tags。
-      # sing-box 的版本基于 Git tag，因此不能使用浅克隆。
       # ============================================================
       - name: Checkout CHIZI sing-box
         uses: actions/checkout@v4
@@ -76,7 +74,44 @@ jobs:
           fetch-tags: true
 
       # ============================================================
-      # 3. 读取 CHIZI 源码信息
+      # 3. 获取 SagerNet 官方版本 tags
+      #
+      # CHIZI fork 不保证携带/保留所有 upstream tag。
+      # 版本号必须依据官方 SagerNet/sing-box tag。
+      # ============================================================
+      - name: Fetch official sing-box tags
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "${UPSTREAM_REPO}"
+          else
+            git remote add upstream "${UPSTREAM_REPO}"
+          fi
+
+          echo "========================================"
+          echo "Fetching official SagerNet tags..."
+          echo "========================================"
+
+          git fetch \
+            --force \
+            --no-recurse-submodules \
+            upstream \
+            '+refs/tags/v*:refs/tags/v*'
+
+          echo
+          echo "Recent official version tags:"
+          git tag \
+            --list 'v[0-9]*' \
+            --sort=-version:refname \
+            | head -n 20
+
+          echo "========================================"
+
+      # ============================================================
+      # 4. 读取 CHIZI 源码信息
       # ============================================================
       - name: Read source metadata
         id: meta
@@ -110,13 +145,7 @@ jobs:
           echo "========================================"
 
       # ============================================================
-      # 4. 检查这个 CHIZI commit 是否已经构建
-      #
-      # 一个 CHIZI SHA 对应一个 Release：
-      #
-      #   chizi-ebpf-e9dbd756
-      #
-      # 定时任务不会反复构建同一源码。
+      # 5. 检查当前 CHIZI SHA 是否已经构建
       # ============================================================
       - name: Check whether already built
         id: existing
@@ -163,7 +192,7 @@ jobs:
           echo "========================================"
 
       # ============================================================
-      # 5. Go
+      # 6. Go
       # ============================================================
       - name: Setup Go
         if: steps.existing.outputs.exists != 'true'
@@ -187,18 +216,22 @@ jobs:
           echo "========================================"
 
       # ============================================================
-      # 6. 生成版本号
+      # 7. 生成版本号
       #
-      # 不再执行 cmd/internal/read_tag。
+      # 优先：
       #
-      # 原因：
-      # read_tag 在 HEAD 不等于 tag 时，本身就会追加 commit SHA，
-      # 再追加 -chizi.<SHA> 会造成 SHA 重复。
+      #   当前 CHIZI HEAD
+      #          ↓
+      #   最近可达的 SagerNet 官方 tag
       #
-      # 最终格式：
+      # 例如：
       #
-      #   1.14.0-rc.1-chizi.e9dbd756
+      #   v1.14.0-beta.17
+      #          ↓
+      #   1.14.0-beta.17-chizi.e9dbd756
       #
+      # 如果当前 CHIZI 历史无法追溯到任何官方版本 tag，
+      # 直接失败，不猜版本。
       # ============================================================
       - name: Determine sing-box base version
         if: steps.existing.outputs.exists != 'true'
@@ -220,23 +253,40 @@ jobs:
           git rev-parse HEAD
 
           echo
-          echo "Nearest sing-box version tag:"
+          echo "Trying to locate nearest reachable official tag..."
 
           BASE_TAG="$(
             git describe \
               --tags \
               --match 'v[0-9]*' \
               --abbrev=0 \
-              HEAD
+              HEAD \
+              2>/dev/null \
+              || true
           )"
 
-          echo "${BASE_TAG}"
+          if [[ -z "${BASE_TAG}" ]]; then
+            echo
+            echo "ERROR: no official sing-box version tag is reachable from:"
+            git rev-parse HEAD
+            echo
+            echo "Official tags were fetched successfully, but none are"
+            echo "an ancestor of the current CHIZI commit."
+            echo
+            echo "Refusing to guess the base version."
+            echo
+            echo "Recent official tags:"
+            git tag \
+              --list 'v[0-9]*' \
+              --sort=-version:refname \
+              | head -n 20
+            exit 1
+          fi
 
           BASE_VERSION="${BASE_TAG#v}"
 
           if [[ -z "${BASE_VERSION}" || "${BASE_VERSION}" == "${BASE_TAG}" ]]; then
-            echo "ERROR: unable to determine valid sing-box base version"
-            echo "BASE_TAG=${BASE_TAG}"
+            echo "ERROR: invalid version tag: ${BASE_TAG}"
             exit 1
           fi
 
@@ -256,10 +306,7 @@ jobs:
           echo "========================================"
 
       # ============================================================
-      # 7. 验证 CHIZI 已提交的 eBPF object
-      #
-      # 当前 CHIZI eBPF 使用 checked-in generated objects。
-      # 构建 ARM64 sing-box 时直接嵌入这些 object。
+      # 8. 验证 checked-in eBPF objects
       # ============================================================
       - name: Verify checked-in eBPF objects
         if: steps.existing.outputs.exists != 'true'
@@ -286,7 +333,7 @@ jobs:
           cat common/ebpf/internal/bpfgen/manifest.txt
 
       # ============================================================
-      # 8. CHIZI eBPF 相关 Go tests
+      # 9. eBPF focused tests
       # ============================================================
       - name: Run focused eBPF tests
         if: steps.existing.outputs.exists != 'true'
@@ -306,10 +353,7 @@ jobs:
             ./option
 
       # ============================================================
-      # 9. 编译 Linux ARM64
-      #
-      # 不在 x86 GitHub runner 上执行 ARM64 binary，
-      # 避免 Exec format error。
+      # 10. 编译 Linux ARM64
       # ============================================================
       - name: Build Linux ARM64
         if: steps.existing.outputs.exists != 'true'
@@ -342,7 +386,7 @@ jobs:
             ./cmd/sing-box
 
       # ============================================================
-      # 10. 静态验证 ARM64 二进制
+      # 11. 验证 ARM64 二进制
       # ============================================================
       - name: Validate ARM64 binary
         if: steps.existing.outputs.exists != 'true'
@@ -376,10 +420,10 @@ jobs:
           fi
 
       # ============================================================
-      # 11. 构建 AMD64 probe
+      # 12. Native AMD64 probe
       #
-      # 用 native AMD64 binary 实际执行 version，
-      # 验证 Version ldflags 和 BUILD_TAGS。
+      # 在 GitHub runner 上实际运行同源码 AMD64 binary，
+      # 验证版本号和 build tags。
       # ============================================================
       - name: Build native AMD64 probe
         if: steps.existing.outputs.exists != 'true'
@@ -422,7 +466,7 @@ jobs:
           fi
 
       # ============================================================
-      # 12. checksum + metadata
+      # 13. checksum + metadata
       # ============================================================
       - name: Create checksum and metadata
         if: steps.existing.outputs.exists != 'true'
@@ -456,7 +500,7 @@ jobs:
           cat sing-box-linux-arm64.sha256
 
       # ============================================================
-      # 13. Workflow artifact
+      # 14. Workflow artifact
       # ============================================================
       - name: Upload workflow artifact
         if: steps.existing.outputs.exists != 'true'
@@ -471,7 +515,7 @@ jobs:
           if-no-files-found: error
 
       # ============================================================
-      # 14. GitHub Release
+      # 15. GitHub Release
       # ============================================================
       - name: Publish GitHub Release
         if: steps.existing.outputs.exists != 'true'
@@ -490,6 +534,7 @@ jobs:
 
           - Version: \`${VERSION}\`
           - Base version: \`${{ steps.version.outputs.base }}\`
+          - Base tag: \`${{ steps.version.outputs.base_tag }}\`
           - Upstream: \`${SOURCE_REPO}\`
           - Branch/ref: \`${{ steps.source_ref.outputs.ref }}\`
           - Commit: \`${{ steps.meta.outputs.sha }}\`
