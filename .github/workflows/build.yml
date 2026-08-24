@@ -29,7 +29,9 @@ concurrency:
 env:
   SOURCE_REPO: CHIZI-0618/sing-box
   SOURCE_BRANCH: testing-ebpf-cilium
+
   UPSTREAM_REPO: https://github.com/SagerNet/sing-box.git
+  UPSTREAM_BRANCH: testing
 
   BUILD_TAGS: >-
     with_ebpf,with_quic,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0
@@ -39,6 +41,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ============================================================
+      # 1. 确定 CHIZI source ref
+      # ============================================================
       - name: Resolve source ref
         id: source_ref
         shell: bash
@@ -58,6 +63,9 @@ jobs:
           echo "Source ref : ${REF}"
           echo "========================================"
 
+      # ============================================================
+      # 2. Checkout CHIZI
+      # ============================================================
       - name: Checkout CHIZI sing-box
         uses: actions/checkout@v4
         with:
@@ -67,9 +75,13 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # 拉取 SagerNet 官方版本 tag。
-      # 使用 quiet，避免每次 Actions 输出数百条旧 tag。
-      - name: Fetch official sing-box tags
+      # ============================================================
+      # 3. 获取官方 SagerNet testing + tags
+      #
+      # 版本号以官方 testing 分支为基准，
+      # 不再使用 CHIZI fork 自己的祖先关系。
+      # ============================================================
+      - name: Fetch official sing-box testing branch and tags
         working-directory: source
         shell: bash
         run: |
@@ -82,7 +94,7 @@ jobs:
           fi
 
           echo "========================================"
-          echo "Fetching official SagerNet version tags..."
+          echo "Fetching SagerNet/${UPSTREAM_BRANCH} and version tags..."
           echo "========================================"
 
           git fetch \
@@ -90,10 +102,15 @@ jobs:
             --force \
             --no-recurse-submodules \
             upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}" \
             '+refs/tags/v*:refs/tags/v*'
 
           echo
-          echo "Most recent version tags:"
+          echo "Official testing HEAD:"
+          git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          echo
+          echo "Recent official version tags:"
 
           git for-each-ref \
             --sort=-version:refname \
@@ -103,6 +120,9 @@ jobs:
 
           echo "========================================"
 
+      # ============================================================
+      # 4. CHIZI 源码信息
+      # ============================================================
       - name: Read source metadata
         id: meta
         working-directory: source
@@ -134,6 +154,9 @@ jobs:
           echo "Commit     : ${COMMIT_SUBJECT}"
           echo "========================================"
 
+      # ============================================================
+      # 5. 检查该 CHIZI SHA 是否已经构建
+      # ============================================================
       - name: Check whether already built
         id: existing
         env:
@@ -178,6 +201,9 @@ jobs:
           echo "Nothing to do."
           echo "========================================"
 
+      # ============================================================
+      # 6. Go
+      # ============================================================
       - name: Setup Go
         if: steps.existing.outputs.exists != 'true'
         uses: actions/setup-go@v5
@@ -199,6 +225,31 @@ jobs:
           go env GOOS GOARCH GOHOSTOS GOHOSTARCH CGO_ENABLED
           echo "========================================"
 
+      # ============================================================
+      # 7. 生成版本号
+      #
+      # 注意：
+      #
+      # 不再：
+      #   git describe CHIZI_HEAD
+      #
+      # 而是：
+      #   git describe upstream/testing
+      #
+      # 当前预期：
+      #
+      #   upstream/testing
+      #        ↓
+      #   v1.14.0-rc.1
+      #
+      #   CHIZI HEAD
+      #        ↓
+      #   e9dbd756
+      #
+      # 最终：
+      #
+      #   1.14.0-rc.1-chizi.e9dbd756
+      # ============================================================
       - name: Determine sing-box base version
         if: steps.existing.outputs.exists != 'true'
         id: version
@@ -207,53 +258,36 @@ jobs:
         run: |
           set -euo pipefail
 
+          UPSTREAM_REF="refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
           echo "========================================"
-          echo "Git repository information"
+          echo "Version information"
           echo "========================================"
 
-          echo "Shallow repository:"
-          git rev-parse --is-shallow-repository
-
-          echo
-          echo "HEAD:"
+          echo "CHIZI HEAD:"
           git rev-parse HEAD
 
           echo
-          echo "Nearest reachable official version tag:"
+          echo "Official ${UPSTREAM_BRANCH} HEAD:"
+          git rev-parse "${UPSTREAM_REF}"
 
           BASE_TAG="$(
             git describe \
               --tags \
               --match 'v[0-9]*' \
               --abbrev=0 \
-              HEAD \
-              2>/dev/null \
-              || true
+              "${UPSTREAM_REF}"
           )"
 
           if [[ -z "${BASE_TAG}" ]]; then
-            echo
-            echo "ERROR: no official sing-box version tag is reachable from:"
-            git rev-parse HEAD
-
-            echo
-            echo "Recent available version tags:"
-
-            git for-each-ref \
-              --sort=-version:refname \
-              --count=20 \
-              --format='%(refname:short)' \
-              'refs/tags/v*'
-
-            echo
-            echo "Refusing to guess the base version."
+            echo "ERROR: unable to determine official sing-box base tag"
             exit 1
           fi
 
           BASE_VERSION="${BASE_TAG#v}"
 
           if [[ -z "${BASE_VERSION}" || "${BASE_VERSION}" == "${BASE_TAG}" ]]; then
-            echo "ERROR: invalid base version tag: ${BASE_TAG}"
+            echo "ERROR: invalid official sing-box version tag: ${BASE_TAG}"
             exit 1
           fi
 
@@ -266,12 +300,16 @@ jobs:
 
           echo
           echo "========================================"
-          echo "Base tag     : ${BASE_TAG}"
-          echo "Base version : ${BASE_VERSION}"
-          echo "Source SHA   : ${SHORT_SHA}"
-          echo "Build version: ${VERSION}"
+          echo "Official branch: ${UPSTREAM_BRANCH}"
+          echo "Base tag       : ${BASE_TAG}"
+          echo "Base version   : ${BASE_VERSION}"
+          echo "CHIZI SHA      : ${SHORT_SHA}"
+          echo "Build version  : ${VERSION}"
           echo "========================================"
 
+      # ============================================================
+      # 8. 验证 checked-in eBPF objects
+      # ============================================================
       - name: Verify checked-in eBPF objects
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -296,6 +334,9 @@ jobs:
           echo "Manifest:"
           cat common/ebpf/internal/bpfgen/manifest.txt
 
+      # ============================================================
+      # 9. focused eBPF tests
+      # ============================================================
       - name: Run focused eBPF tests
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -313,6 +354,9 @@ jobs:
             ./include \
             ./option
 
+      # ============================================================
+      # 10. Build Linux ARM64
+      # ============================================================
       - name: Build Linux ARM64
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -343,6 +387,9 @@ jobs:
             -o dist/sing-box-linux-arm64 \
             ./cmd/sing-box
 
+      # ============================================================
+      # 11. Validate ARM64
+      # ============================================================
       - name: Validate ARM64 binary
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -374,6 +421,9 @@ jobs:
             exit 1
           fi
 
+      # ============================================================
+      # 12. AMD64 native probe
+      # ============================================================
       - name: Build native AMD64 probe
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -414,6 +464,9 @@ jobs:
             exit 1
           fi
 
+      # ============================================================
+      # 13. checksum + metadata
+      # ============================================================
       - name: Create checksum and metadata
         if: steps.existing.outputs.exists != 'true'
         working-directory: source
@@ -431,6 +484,7 @@ jobs:
           Commit: ${{ steps.meta.outputs.sha }}
           Commit date: ${{ steps.meta.outputs.commit_date }}
           Commit subject: ${{ steps.meta.outputs.commit_subject }}
+          Version source: SagerNet/sing-box ${UPSTREAM_BRANCH}
           Base tag: ${{ steps.version.outputs.base_tag }}
           Base version: ${{ steps.version.outputs.base }}
           Build version: ${{ steps.version.outputs.version }}
@@ -445,6 +499,9 @@ jobs:
 
           cat sing-box-linux-arm64.sha256
 
+      # ============================================================
+      # 14. Artifact
+      # ============================================================
       - name: Upload workflow artifact
         if: steps.existing.outputs.exists != 'true'
         uses: actions/upload-artifact@v4
@@ -457,6 +514,9 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      # ============================================================
+      # 15. Release
+      # ============================================================
       - name: Publish GitHub Release
         if: steps.existing.outputs.exists != 'true'
         env:
@@ -475,7 +535,8 @@ jobs:
           - Version: \`${VERSION}\`
           - Base version: \`${{ steps.version.outputs.base }}\`
           - Base tag: \`${{ steps.version.outputs.base_tag }}\`
-          - Upstream: \`${SOURCE_REPO}\`
+          - Version source: \`SagerNet/sing-box ${UPSTREAM_BRANCH}\`
+          - Source: \`${SOURCE_REPO}\`
           - Branch/ref: \`${{ steps.source_ref.outputs.ref }}\`
           - Commit: \`${{ steps.meta.outputs.sha }}\`
           - Commit date: \`${{ steps.meta.outputs.commit_date }}\`
