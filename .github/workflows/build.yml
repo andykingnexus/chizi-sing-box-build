@@ -23,7 +23,7 @@ concurrency:
 env:
   SOURCE_REPO: CHIZI-0618/sing-box
   SOURCE_BRANCH: testing-ebpf-cilium
-  BUILD_TAGS: with_ebpf,with_quic,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0
+  BUILD_TAGS: with_ebpf,with_quic,with_utls,with_clash_api
 
 jobs:
   build:
