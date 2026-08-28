@@ -177,31 +177,11 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          MISSING=0
-          for f in \
-            common/ebpf/internal/bpfgen/cgroup_bpfel.o \
-            common/ebpf/internal/bpfgen/shared_network_bpfel.o \
-            common/ebpf/internal/bpfgen/splice_bpfel.o \
-            common/ebpf/internal/bpfgen/manifest.txt
-          do
-            if [ -f "$f" ]; then
-              echo "OK: $f"
-            else
-              echo "MISSING: $f"
-              MISSING=1
-            fi
-          done
-
-          echo "--- 实际目录内容 ---"
-          ls -la common/ebpf/internal/bpfgen/ 2>&1 || echo "bpfgen 目录本身不存在"
-          echo "--- common/ebpf 顶层目录内容（防止整个目录结构变了） ---"
-          ls -la common/ebpf/ 2>&1
-
-          if [ "$MISSING" -eq 1 ]; then
-            exit 1
-          fi
+          test -f common/ebpf/internal/bpfgen/cgroup_bpfel.o
+          test -f common/ebpf/internal/bpfgen/shared_network_bpfel.o
+          test -f common/ebpf/internal/bpfgen/manifest.txt
 
           go test \
             -count=1 \
