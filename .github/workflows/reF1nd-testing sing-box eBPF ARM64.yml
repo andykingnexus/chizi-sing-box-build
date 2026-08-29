@@ -1,0 +1,144 @@
+name: Build reF1nd-testing sing-box eBPF ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Upstream ref to build (branch/tag/commit)"
+        type: string
+        required: true
+        default: "reF1nd-testing-next"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout reF1nd upstream source
+      # ------------------------------------------------------------
+      - name: Checkout reF1nd upstream
+        uses: actions/checkout@v6
+        with:
+          repository: reF1nd/sing-box
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      # ------------------------------------------------------------
+      # 2. Setup Go
+      #
+      # Automatically follows the Go version declared by upstream go.mod.
+      # ------------------------------------------------------------
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # ------------------------------------------------------------
+      # 3. Define source/version/build metadata
+      # ------------------------------------------------------------
+      - name: Define build metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="${SHA:0:7}"
+
+          # Find the latest reachable reF1nd version tag.
+          VERSION_TAG="$(git describe \
+            --tags \
+            --abbrev=0 \
+            --match 'v*-reF1nd*' \
+            HEAD)"
+
+          VERSION="${VERSION_TAG#v}"
+
+          # Build tags.
+          # Add/remove optional tags here whenever needed.
+          TAGS="with_ebpf,with_quic,with_utls,with_clash_api"
+
+          OUT="sing-box-${VERSION}-linux-arm64"
+
+          echo "SOURCE_REF=${{ inputs.source_ref }}" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SHA=${SHA}" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAGS=${TAGS}" >> "$GITHUB_ENV"
+          echo "OUT=${OUT}" >> "$GITHUB_ENV"
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "out=${OUT}" >> "$GITHUB_OUTPUT"
+
+          echo "========================================"
+          echo "Repository : reF1nd/sing-box"
+          echo "Source ref : ${{ inputs.source_ref }}"
+          echo "Commit     : ${SHA}"
+          echo "Version    : ${VERSION}"
+          echo "Tags       : ${TAGS}"
+          echo "Output     : ${OUT}"
+          echo "========================================"
+
+      # ------------------------------------------------------------
+      # 4. Build Linux ARM64 sing-box
+      #
+      # Current eBPF implementation does not require CGO.
+      #
+      # No:
+      # - musl cross compiler
+      # - cronet-go
+      # - Chromium toolchain
+      # - libbpf-dev
+      # - kernel headers
+      # - eBPF regeneration
+      #
+      # Pre-generated BPF objects are already included upstream.
+      # ------------------------------------------------------------
+      - name: Build sing-box ARM64
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: arm64
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+
+          LDFLAGS_SHARED="$(cat release/LDFLAGS)"
+
+          go build \
+            -v \
+            -trimpath \
+            -buildvcs=false \
+            -tags "${TAGS}" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${VERSION} ${LDFLAGS_SHARED} -s -w -buildid=" \
+            -o "${OUT}" \
+            ./cmd/sing-box
+
+      # ------------------------------------------------------------
+      # 5. Make executable
+      # ------------------------------------------------------------
+      - name: Prepare executable
+        run: chmod +x "${OUT}"
+
+      # ------------------------------------------------------------
+      # 6. Upload artifact
+      # ------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sing-box-linux-arm64-ebpf-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.short }}
+          path: ${{ steps.meta.outputs.out }}
+          if-no-files-found: error
