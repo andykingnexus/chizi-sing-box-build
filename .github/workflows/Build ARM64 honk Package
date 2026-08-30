@@ -1,0 +1,121 @@
+name: Build ARM64 honk Package (Rust)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ARM64 honk APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          repository: 'daeuniverse/honk'
+          fetch-depth: 0
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # 必须指定目标为 musl，才能在 OpenWrt 完美原生运行
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install System Dependencies (LLVM/Clang)
+        # 必须安装 clang 与 llvm，这是编译 eBPF BPF 字节码的硬性依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev gcc-aarch64-linux-gnu
+
+      - name: Install Zig & cargo-zigbuild
+        # 引入业界最强的交叉编译神器 zigbuild，完美解决 Rust 链接 aarch64-musl 的报错痛点
+        run: |
+          sudo npm install -g @ziglang/cli
+          pipx install cargo-zigbuild
+
+      - name: Robust Version Extraction
+        id: ver
+        run: |
+          set -xeuo pipefail
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          DATE_STR=$(date +%Y%m%d)
+          APK_VER="${DATE_STR}.${COMMIT_COUNT}_git${SHORT_SHA}"
+          echo "APK_VER=${APK_VER}" >> "$GITHUB_ENV"
+
+      - name: Compile Binary (Rust aarch64-musl)
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist/bin
+          
+          # 核心：使用 cargo-zigbuild 静态编译 release 版本
+          cargo zigbuild --target aarch64-unknown-linux-musl --release
+          
+          # 提取产物并用 aarch64-strip 瘦身，减小闪存占用
+          cp target/aarch64-unknown-linux-musl/release/honk dist/bin/honk
+          aarch64-linux-gnu-strip dist/bin/honk
+
+      - name: Generate OpenWrt Service Scripts
+        run: |
+          mkdir -p dist/etc/init.d
+          # 注入 OpenWrt 原生 procd 守护脚本，确保系统能自动管控进程
+          cat > dist/etc/init.d/honk <<'EOF'
+          #!/bin/sh /etc/rc.common
+          USE_PROCD=1
+          START=99
+
+          start_service() {
+              procd_open_instance
+              procd_set_param command /usr/bin/honk
+              procd_set_param respawn
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+          EOF
+          chmod +x dist/etc/init.d/honk
+
+      - name: Package Standard APK
+        run: |
+          set -xeuo pipefail
+          mkdir -p apk_pkg
+          cp -r dist/* apk_pkg/
+
+          cat > apk_pkg/APKBUILD <<EOF
+          # Maintainer: Custom Builder <builder@local.domain>
+          pkgname=honk
+          pkgver=${APK_VER}
+          pkgrel=0
+          pkgdesc="Honk daemon (Rust rewrite of dae)"
+          url="https://github.com/daeuniverse/honk"
+          arch="aarch64_cortex-a53"
+          license="GPL-3.0"
+          depends=""
+          options="!check !strip !tracedeps"
+          source="honk init.d-honk"
+
+          package() {
+              install -Dm755 "\$srcdir"/bin/honk "\$pkgdir"/usr/bin/honk
+              install -Dm755 "\$srcdir"/etc/init.d/honk "\$pkgdir"/etc/init.d/honk
+          }
+          EOF
+
+          docker run --rm -v "${PWD}:/build" -w /build/apk_pkg alpine:latest sh -e -c '
+            apk update && apk add --no-cache alpine-sdk openssl
+            mkdir -p /root/.abuild /etc/apk/keys
+            openssl genrsa -out /root/.abuild/key.rsa 2048
+            openssl rsa -in /root/.abuild/key.rsa -pubout -out /root/.abuild/key.rsa.pub
+            cp /root/.abuild/key.rsa.pub /etc/apk/keys/
+            echo "PACKAGER_PRIVKEY=\"/root/.abuild/key.rsa\"" > /etc/abuild.conf
+            
+            abuild -F checksum
+            CARCH=aarch64_cortex-a53 abuild -F -d -f -P /build/dist/output
+          '
+          
+          mkdir -p dist/apk
+          find dist/output -name "*.apk" -exec cp {} dist/apk/ \;
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: honk-openwrt-aarch64_cortex-a53
+          path: dist/apk/*.apk
