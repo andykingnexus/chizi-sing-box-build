@@ -82,7 +82,10 @@ jobs:
         run: |
           set -xeuo pipefail
           mkdir -p apk_pkg
-          cp -r dist/* apk_pkg/
+          
+          # 【修复点】：将文件直接扁平化拷贝到 apk_pkg 根目录，重命名以严格匹配 source 变量
+          cp dist/bin/honk apk_pkg/honk
+          cp dist/etc/init.d/honk apk_pkg/init.d-honk
 
           cat > apk_pkg/APKBUILD <<EOF
           # Maintainer: Custom Builder <builder@local.domain>
@@ -98,8 +101,9 @@ jobs:
           source="honk init.d-honk"
 
           package() {
-              install -Dm755 "\$srcdir"/bin/honk "\$pkgdir"/usr/bin/honk
-              install -Dm755 "\$srcdir"/etc/init.d/honk "\$pkgdir"/etc/init.d/honk
+              # 从源目录直接安装到虚拟根目录的对应位置
+              install -Dm755 "\$srcdir"/honk "\$pkgdir"/usr/bin/honk
+              install -Dm755 "\$srcdir"/init.d-honk "\$pkgdir"/etc/init.d/honk
           }
           EOF
 
@@ -111,6 +115,7 @@ jobs:
             cp /root/.abuild/key.rsa.pub /etc/apk/keys/
             echo "PACKAGER_PRIVKEY=\"/root/.abuild/key.rsa\"" > /etc/abuild.conf
             
+            # 生成哈希校验并执行交叉架构打包
             abuild -F checksum
             CARCH=aarch64_cortex-a53 abuild -F -d -f -P /build/dist/output
           '
