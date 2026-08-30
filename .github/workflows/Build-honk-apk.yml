@@ -47,12 +47,16 @@ jobs:
           set -xeuo pipefail
           mkdir -p dist/bin
           
-          # 核心：使用 cargo-zigbuild 静态编译 release 版本
+          # 静态编译
           cargo zigbuild --target aarch64-unknown-linux-musl --release
           
-          # 提取产物并用 aarch64-strip 瘦身，减小闪存占用
-          cp target/aarch64-unknown-linux-musl/release/honk dist/bin/honk
+          # 核心修改点：提取真实的 honk-core 并重命名为 honk 供系统使用
+          cp target/aarch64-unknown-linux-musl/release/honk-core dist/bin/honk
           aarch64-linux-gnu-strip dist/bin/honk
+          
+          # 如果还需要提取 honk-tool，可以取消下面两行的注释
+          # cp target/aarch64-unknown-linux-musl/release/honk-tool dist/bin/honk-tool
+          # aarch64-linux-gnu-strip dist/bin/honk-tool
 
       - name: Generate OpenWrt Service Scripts
         run: |
