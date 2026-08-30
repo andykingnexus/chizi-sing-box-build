@@ -37,9 +37,9 @@ jobs:
         run: |
           set -xeuo pipefail
           COMMIT_COUNT=$(git rev-list --count HEAD)
-          SHORT_SHA=$(git rev-parse --short=7 HEAD)
           DATE_STR=$(date +%Y%m%d)
-          APK_VER="${DATE_STR}.${COMMIT_COUNT}_git${SHORT_SHA}"
+          # 【修复】：去掉字母哈希，采用纯数字版本号 (例如: 20260830.694)
+          APK_VER="${DATE_STR}.${COMMIT_COUNT}"
           echo "APK_VER=${APK_VER}" >> "$GITHUB_ENV"
 
       - name: Compile Binary (Rust aarch64-musl)
